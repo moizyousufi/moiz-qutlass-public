@@ -30,6 +30,7 @@
 
 #include "include/gemm.h"
 #include "include/fused_quantize_host.h"
+#include "include/fused_quantize_host_v2.h"
 #include "include/backward_host.h"
 
 namespace QUTLASS {
@@ -237,10 +238,13 @@ std::tuple<torch::Tensor, torch::Tensor> fusedQuantizeMxQuest(torch::Tensor cons
         fusedQuantizeMxQuestHad64_host(OUT, OUT_sf, A, B);
     } else if(HAD_GS==128){
         fusedQuantizeMxQuestHad128_host(OUT, OUT_sf, A, B);
+    } else if(HAD_GS==256){
+        fusedQuantizeMxQuestHad256_host(OUT, OUT_sf, A, B);
     } else {
         TORCH_CHECK(false,
                     "Unsupported rotation size ", HAD_GS,
-                    "; expected 32, 64, or 128.");
+                    "; expected 32, 64, 128, or 256. "
+                    "K>256 exceeds CUTLASS warp tile size limits (WarpShape too wide).");
     }
 
     return std::make_tuple(OUT, OUT_sf);
@@ -308,7 +312,7 @@ std::tuple<torch::Tensor, torch::Tensor> fusedQuantizeMxAbsMax(torch::Tensor con
     } else if(HAD_GS==64){
         fusedQuantizeMxAbsMaxHad64_host(OUT, OUT_sf, A, B);
     } else if(HAD_GS==128){
-#if TARGET_CUDA_ARCH == 100
+#if TARGET_CUDA_ARCH == 100 || TARGET_CUDA_ARCH == 103
         auto opts = torch::TensorOptions().dtype(torch::kFloat).device(A.device());
         auto global_scale = torch::tensor(0.0f, opts); //FIXME: add input global_scale to interface for consistency
         fusedQuantizeMxAbsMax_host_sm100(OUT, OUT_sf, A, B, global_scale);
@@ -316,11 +320,78 @@ std::tuple<torch::Tensor, torch::Tensor> fusedQuantizeMxAbsMax(torch::Tensor con
         fusedQuantizeMxAbsMaxHad128_host(OUT, OUT_sf, A, B);
 #endif
 
+    } else if(HAD_GS==256){
+        fusedQuantizeMxAbsMaxHad256_host(OUT, OUT_sf, A, B);
     } else {
         TORCH_CHECK(false,
                     "Unsupported rotation size ", HAD_GS,
-                    "; expected 32, 64, or 128.");
+                    "; expected 32, 64, 128, or 256. "
+                    "K>256 exceeds CUTLASS warp tile size limits (WarpShape too wide).");
     }
+
+    return std::make_tuple(OUT, OUT_sf);
+}
+
+//=============================================================================
+// CUTLASS 4.x v2 API - Supports arbitrary K dimensions (32, 64, 128, 256, 512, 1024, 2048, 4096, ...)
+//=============================================================================
+
+std::tuple<torch::Tensor, torch::Tensor> fusedQuantizeMxQuest_v2(
+    torch::Tensor const& A,
+    torch::Tensor const& H,
+    torch::Tensor& OUT,
+    torch::Tensor& OUT_sf)
+{
+    torch::checkAllContiguous("fusedQuantizeMxQuest_v2", {{A, "A", 0},
+                                                          {H, "H", 1},
+                                                          {OUT, "OUT", 2},
+                                                          {OUT_sf, "OUT_sf", 3}});
+    torch::checkDeviceType("fusedQuantizeMxQuest_v2", {A, H, OUT, OUT_sf}, at::DeviceType::CUDA);
+    torch::checkAllSameGPU("fusedQuantizeMxQuest_v2", {{A, "A", 0},
+                                                       {H, "H", 1},
+                                                       {OUT, "OUT", 2},
+                                                       {OUT_sf, "OUT_sf", 3}});
+    TORCH_CHECK(A.scalar_type() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(H.scalar_type() == at::kBFloat16, "H must be bf16");
+    TORCH_CHECK(H.size(0) == H.size(1), "Rotation matrix must be square");
+
+    uint32_t K = H.size(0);
+    TORCH_CHECK(K >= 32, "K must be at least 32");
+    TORCH_CHECK(K % 32 == 0, "K must be divisible by 32");
+    TORCH_CHECK((A.numel() % K) == 0, "A must be divisible by K");
+
+    // Call CUTLASS 4.x implementation - works for ANY K!
+    QUTLASS_V2::fusedQuantizeMxQuest_v2(OUT, OUT_sf, A, H);
+
+    return std::make_tuple(OUT, OUT_sf);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fusedQuantizeMxAbsMax_v2(
+    torch::Tensor const& A,
+    torch::Tensor const& H,
+    torch::Tensor& OUT,
+    torch::Tensor& OUT_sf)
+{
+    torch::checkAllContiguous("fusedQuantizeMxAbsMax_v2", {{A, "A", 0},
+                                                           {H, "H", 1},
+                                                           {OUT, "OUT", 2},
+                                                           {OUT_sf, "OUT_sf", 3}});
+    torch::checkDeviceType("fusedQuantizeMxAbsMax_v2", {A, H, OUT, OUT_sf}, at::DeviceType::CUDA);
+    torch::checkAllSameGPU("fusedQuantizeMxAbsMax_v2", {{A, "A", 0},
+                                                        {H, "H", 1},
+                                                        {OUT, "OUT", 2},
+                                                        {OUT_sf, "OUT_sf", 3}});
+    TORCH_CHECK(A.scalar_type() == at::kBFloat16, "A must be bf16");
+    TORCH_CHECK(H.scalar_type() == at::kBFloat16, "H must be bf16");
+    TORCH_CHECK(H.size(0) == H.size(1), "Rotation matrix must be square");
+
+    uint32_t K = H.size(0);
+    TORCH_CHECK(K >= 32, "K must be at least 32");
+    TORCH_CHECK(K % 32 == 0, "K must be divisible by 32");
+    TORCH_CHECK((A.numel() % K) == 0, "A must be divisible by K");
+
+    // Call CUTLASS 4.x implementation - works for ANY K!
+    QUTLASS_V2::fusedQuantizeMxAbsMax_v2(OUT, OUT_sf, A, H);
 
     return std::make_tuple(OUT, OUT_sf);
 }
@@ -399,7 +470,7 @@ std::tuple<torch::Tensor, torch::Tensor> fusedQuantizeNvAbsMax(torch::Tensor con
     } else if(HAD_GS==64){
         fusedQuantizeNvAbsMaxHad64_host(OUT, OUT_sf, A, B, global_scale);
     } else if(HAD_GS==128){
-#if TARGET_CUDA_ARCH == 100
+#if TARGET_CUDA_ARCH == 100 || TARGET_CUDA_ARCH == 103
         fusedQuantizeNvAbsMax_host_sm100(OUT, OUT_sf, A, B, global_scale);
 #elif TARGET_CUDA_ARCH == 120
         fusedQuantizeNvAbsMaxHad128_host(OUT, OUT_sf, A, B, global_scale);
@@ -530,6 +601,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m
     m.def("fusedQuantizeMxAbsMax", &QUTLASS::fusedQuantizeMxAbsMax, "fusedQuantizeMxAbsMax");
     m.def("fusedQuantizeNvQuest",  &QUTLASS::fusedQuantizeNvQuest,  "fusedQuantizeNvQuest");
     m.def("fusedQuantizeNvAbsMax", &QUTLASS::fusedQuantizeNvAbsMax, "fusedQuantizeNvAbsMax");
+
+    m.def("fusedQuantizeMxQuest_v2",  &QUTLASS::fusedQuantizeMxQuest_v2,  "fusedQuantizeMxQuest_v2 (CUTLASS 4.x, arbitrary K)");
+    m.def("fusedQuantizeMxAbsMax_v2", &QUTLASS::fusedQuantizeMxAbsMax_v2, "fusedQuantizeMxAbsMax_v2 (CUTLASS 4.x, arbitrary K)");
 
     m.def("backward_t_bf16",  &backward_t_bf16,  "backward_t_bf16");
     m.def("backward_qt_bf16", &backward_qt_bf16, "backward_qt_bf16");
