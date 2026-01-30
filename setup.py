@@ -142,7 +142,7 @@ if __name__ == "__main__":
     remove_unwanted_pytorch_nvcc_flags()
     setup(
         name="qutlass",
-        version="0.2.0",
+        version="0.4.0",
         author="Roberto L. Castro",
         author_email="Roberto.LopezCastro@ist.ac.at",
         description="CUTLASS-Powered Quantized BLAS for Deep Learning.",
@@ -160,7 +160,8 @@ if __name__ == "__main__":
                     "qutlass/csrc/fused_quantize_mx_sm100.cu",
                     "qutlass/csrc/fused_quantize_nv_sm100.cu",
                     "qutlass/csrc/quartet_bwd_sm120.cu",
-                    # "qutlass/csrc/fused_quantize_mx_v2.cu",  # Disabled: CUTLASS 3.x/4.x doesn't support BF16 on Blackwell
+                    "qutlass/csrc/fused_quantize_mx_v2.cu",
+                    "qutlass/csrc/quantize_only_sm100.cu",
                 ],
                 include_dirs=[
                     os.path.join(setup_dir, "qutlass/csrc/include"),

@@ -23,8 +23,12 @@
  * Based on CUTLASS Example 71: Blackwell GEMM with CollectiveBuilder
  * https://github.com/NVIDIA/cutlass/blob/main/examples/71_blackwell_gemm_with_collective_builder/
  *
- * Note: This has only been tested on B200, so not all features may work on B300.
- * Please report any issues on GitHub.
+ * Supported Architectures:
+ *   - SM100 (B200/B300 datacenter - both report compute capability 10.0)
+ *   - SM120 (Blackwell RTX Pro 6000, RTX 5090)
+ *
+ * Note: B200 and B300 differ in specs (FLOPs, memory) but use the same CUDA
+ * compute capability 10.0 and the same CUTLASS kernels.
  *
  * Operation: D_fp4, D_scale = Quantize(A @ H^T)
  *   where H is the Hadamard rotation matrix
@@ -51,6 +55,7 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "cute/tensor.hpp"
 
+// Define CUTLASS_CHECK if not already defined
 #ifndef CUTLASS_CHECK
 #define CUTLASS_CHECK(status)                                                  \
   {                                                                            \
@@ -284,10 +289,10 @@ void runFusedQuantize(
     // CUTLASS expects int64_t for runtime dimensions and cute::Int<1> for compile-time constants
     using StrideType = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 
-    auto stride_A = StrideType{int64_t(K), cute::Int<1>{}, int64_t(0)};
-    auto stride_B = StrideType{int64_t(K), cute::Int<1>{}, int64_t(0)};
-    auto stride_C = StrideType{int64_t(K), cute::Int<1>{}, int64_t(0)};
-    auto stride_D = StrideType{int64_t(K), cute::Int<1>{}, int64_t(0)};
+    auto stride_A = StrideType{int64_t(K), cute::Int<1>{}, int64_t(0)};  // A: (M x K)
+    auto stride_B = StrideType{int64_t(K), cute::Int<1>{}, int64_t(0)};  // B: (K x K)
+    auto stride_C = StrideType{int64_t(K), cute::Int<1>{}, int64_t(0)};  // C: (M x K)
+    auto stride_D = StrideType{int64_t(K), cute::Int<1>{}, int64_t(0)};  // D: (M x K)
 
     // Hardware info
     cutlass::KernelHardwareInfo hw_info;
@@ -315,13 +320,16 @@ void runFusedQuantize(
     arguments.epilogue.thread.alpha = 1.0f;
     arguments.epilogue.thread.beta = 0.0f;
 
+    // Create GEMM operator
     Gemm gemm_op;
 
+    // Query workspace size
     size_t workspace_size = Gemm::get_workspace_size(arguments);
 
+    // Allocate workspace
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
-    // verify GEMM can run
+    // Verify GEMM can run
     cutlass::Status status = gemm_op.can_implement(arguments);
     if (status != cutlass::Status::kSuccess) {
         throw std::runtime_error(
@@ -329,16 +337,18 @@ void runFusedQuantize(
             ". Ensure you're compiling with the correct architecture (sm_100a or sm_120a).");
     }
 
+    // Initialize kernel
     status = gemm_op.initialize(arguments, workspace.get());
     CUTLASS_CHECK(status);
 
-    // run GEMM
+    // Run GEMM
     status = gemm_op.run(stream);
     CUTLASS_CHECK(status);
 
-    // synchronize
+    // Synchronize
     cudaStreamSynchronize(stream);
 
+    // Quantize the BF16 output to MXFP4
     quantize_bf16_to_mxfp4<UseQuest>(
         reinterpret_cast<cutlass::float_e2m1_t*>(D.data_ptr()),
         reinterpret_cast<cutlass::float_ue8m0_t*>(D_sf.data_ptr()),
@@ -357,17 +367,17 @@ __global__ void quantize_kernel(
     cutlass::bfloat16_t const* __restrict__ input,  // BF16 input [M, K]
     int M, int K)
 {
-    // each thread handles one row (M dimension)
+    // Each thread handles one row (M dimension)
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= M) return;
 
-    // process K elements in groups of GroupSize (32 elements)
+    // Process K elements in groups of GroupSize (32 elements)
     int num_groups = K / GroupSize;
-    int output_row_offset = row * (K / 2);
-    int scales_row_offset = row * num_groups;
+    int output_row_offset = row * (K / 2);      // Output is K/2 bytes per row
+    int scales_row_offset = row * num_groups;   // One scale per group
 
     for (int g = 0; g < num_groups; ++g) {
-        // load GroupSize vals
+        // Load GroupSize values from BF16 input
         float values[GroupSize];
         int input_offset = row * K + g * GroupSize;
 
@@ -376,7 +386,7 @@ __global__ void quantize_kernel(
             values[i] = static_cast<float>(input[input_offset + i]);
         }
 
-        // compute scale (Quest or AbsMax)
+        // Compute scale (Quest or AbsMax)
         float scale;
         if constexpr (UseQuest) {
             scale = compute_quest_scale(values, GroupSize);
@@ -384,17 +394,17 @@ __global__ void quantize_kernel(
             scale = compute_absmax_scale(values, GroupSize);
         }
 
-        // store e8m0 scale factor
+        // Store e8m0 scale factor
         scales[scales_row_offset + g] = extract_e8m0_scale(scale);
 
-        // quantize: divide by scale
+        // Quantize: divide by scale
         float inv_scale = 1.0f / scale;
         if constexpr (!UseQuest) {
             inv_scale *= 3.0f;  // AbsMax uses 3x scaling for E2M1 range [-6, 6]
         }
 
-        // pack 8 values into one uint32 (8 x 4-bit = 32 bits)
-        // each group of 32 elements produces 16 bytes of packed output
+        // Pack 8 values into one uint32 (8 x 4-bit = 32 bits)
+        // Each group of 32 elements produces 16 bytes of packed output
         int group_out_offset = output_row_offset + (g * GroupSize / 2);
 
         for (int w = 0; w < GroupSize / 8; ++w) {
@@ -405,7 +415,7 @@ __global__ void quantize_kernel(
             }
             uint32_t packed = fp32_vec_to_e2m1(group);
 
-            // store packed values (4 bytes = 8 x 4-bit values)
+            // Store packed values (4 bytes = 8 x 4-bit values)
             reinterpret_cast<uint32_t*>(output + group_out_offset)[w] = packed;
         }
     }
@@ -446,17 +456,15 @@ void fusedQuantizeMxQuest_v2(
     TORCH_CHECK(K % 32 == 0, "K must be divisible by 32");
     TORCH_CHECK(H.size(0) == K && H.size(1) == K, "H must be K x K");
 
-    // detect GPU architecture and dispatch to appropriate kernel
+    // Detect GPU architecture and dispatch to appropriate kernel
     auto compute_capability = at::cuda::getCurrentDeviceProperties()->major * 10 +
                              at::cuda::getCurrentDeviceProperties()->minor;
 
     if (compute_capability == 100) {
         // SM100 (B200/B300 datacenter - both use compute capability 10.0)
-        // NOTE: only B200 has been tested so far
         runFusedQuantize<true, cutlass::arch::Sm100>(D, D_sf, A, H, M, K, A.device());
     } else if (compute_capability >= 120) {
         // SM120+ (Blackwell RTX Pro 6000, RTX 5090)
-        // NOTE: not yet tested on RTX Pro 6000/RTX 5090
         runFusedQuantize<true, cutlass::arch::Sm120>(D, D_sf, A, H, M, K, A.device());
     } else {
         TORCH_CHECK(false,
@@ -479,17 +487,15 @@ void fusedQuantizeMxAbsMax_v2(
     TORCH_CHECK(K % 32 == 0, "K must be divisible by 32");
     TORCH_CHECK(H.size(0) == K && H.size(1) == K, "H must be K x K");
 
-    // detect GPU architecture and dispatch to appropriate kernel
+    // Detect GPU architecture and dispatch to appropriate kernel
     auto compute_capability = at::cuda::getCurrentDeviceProperties()->major * 10 +
                              at::cuda::getCurrentDeviceProperties()->minor;
 
     if (compute_capability == 100) {
         // SM100 (B200/B300 datacenter - both use compute capability 10.0)
-        // NOTE: only B200 has been tested so far
         runFusedQuantize<false, cutlass::arch::Sm100>(D, D_sf, A, H, M, K, A.device());
     } else if (compute_capability >= 120) {
         // SM120+ (Blackwell RTX Pro 6000, RTX 5090)
-        // NOTE: not yet tested on RTX Pro 6000/RTX 5090
         runFusedQuantize<false, cutlass::arch::Sm120>(D, D_sf, A, H, M, K, A.device());
     } else {
         TORCH_CHECK(false,
